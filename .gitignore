@@ -62,3 +62,9 @@ htmlcov/
 
 # If you use Jupyter notebooks (just in case)
 .ipynb_checkpoints/
+
+
+.jpg
+.png
+.jpeg
+.gif
