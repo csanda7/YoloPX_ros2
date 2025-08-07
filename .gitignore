@@ -1,0 +1,64 @@
+# Byte-compiled / cache files
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# ROS2/Colcon build artifacts
+build/
+install/
+log/
+.colcon/
+*.launch.pyc
+*.launch.py~
+
+# Compiled Python files
+*.so
+
+# VSCode stuff
+.vscode/
+*.code-workspace
+
+# Environment
+venv/
+.env
+env/
+
+# Output and test results
+output/
+*.log
+
+# Egg info / build metadata
+*.egg-info/
+*.egg
+*.manifest
+*.spec
+
+# ONNX models (if they're generated – otherwise remove this!)
+*.onnx
+
+# Misc
+.DS_Store
+*.swp
+*.bak
+
+# Ignore launch/test/resource if generated dynamically
+launch/
+test/
+resource/
+
+# Python packaging
+dist/
+build/
+*.whl
+
+# Backup files
+*~
+
+# If you're using pytest or similar:
+.pytest_cache/
+coverage.xml
+htmlcov/
+
+# If you use Jupyter notebooks (just in case)
+.ipynb_checkpoints/
