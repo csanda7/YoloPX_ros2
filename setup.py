@@ -12,7 +12,7 @@ setup(
         ('share/' + package_name, ['package.xml']),
         ('share/' + package_name + '/launch', ['launch/segmentation.launch.py']),
     ],
-    install_requires=['setuptools', 'onnxruntime', 'numpy', 'opencv-python'],
+    install_requires=['setuptools', 'numpy', 'opencv-python', 'cuda-python', 'tensorrt'],
     zip_safe=True,
     maintainer='csanda',
     maintainer_email='csandanorbert@gmail.com',
@@ -21,7 +21,7 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'segmentation_sub = yolopx.segmentation_sub:main'
+            'seg_sub_trt = yolopx.seg_sub_trt:main'
         ],
     },
 )
