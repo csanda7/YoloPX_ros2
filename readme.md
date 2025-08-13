@@ -32,7 +32,7 @@ A `config.py` fájlban adhatod meg:
 A node indítása:
 
 ```bash
-ros2 run yolopx seg_sub_trt
+ros2 launch yolopx seg_sub_trt
 ```
 
 
