@@ -36,6 +36,7 @@ output/
 
 # ONNX models (if they're generated – otherwise remove this!)
 *.onnx
+*.engine
 
 # Misc
 .DS_Store
