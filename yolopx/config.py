@@ -1,5 +1,5 @@
 # ------------------------------ Model & IO ---------------------------------
-ENGINE: str = "/path/to/model.engine"
+ENGINE: str = "path/to/.engine"  
 TOPIC: str = "/zed2i/zed_node/left/image_rect_color"
 RELIABLE: bool = False  
 SHOW: bool = True       #opencv ablak

@@ -9,8 +9,6 @@ build/
 install/
 log/
 .colcon/
-*.launch.pyc
-*.launch.py~
 
 # Compiled Python files
 *.so
@@ -44,7 +42,6 @@ output/
 *.bak
 
 # Ignore launch/test/resource if generated dynamically
-launch/
 test/
 resource/
 
