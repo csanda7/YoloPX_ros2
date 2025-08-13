@@ -5,7 +5,7 @@ def generate_launch_description():
     return LaunchDescription([
         Node(
             package='yolopx',
-            executable='seg_sub_trt',  # ugyanaz, ami ros2 run-nál működik
+            executable='seg_sub_trt',  
             name='yolopx_trt',
             output='screen',
             emulate_tty=True
