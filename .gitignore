@@ -43,7 +43,7 @@ output/
 
 # Ignore launch/test/resource if generated dynamically
 test/
-resource/
+
 
 # Python packaging
 dist/
