@@ -1,23 +1,8 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-"""
-TensorRT 10.3-compatible ROS2 + CUDA-Python inference node for YOLOPx-style
-lane/drivable area heads on NVIDIA Jetson Orin (JetPack 6.2.1).
-
-Key points for TRT 10.3 compatibility:
-- Uses the name-based runtime API: get_tensor_name/get_tensor_mode/get_tensor_shape,
-  set_input_shape, set_tensor_address, execute_async_v3.
-- Does NOT rely on newer 10.9+/13.x-only helpers.
-- CUDA-Python (cuda.cudart) calls are used with tuple/byref fallbacks so it
-  works across CUDA 12.x on Jetson.
-
-Author: ChatGPT (patched for TRT 10.3)
-"""
-
 # ============================== Standard libs ===============================
 import ctypes
-import sys
 import time
 import json
 from pathlib import Path
@@ -30,42 +15,33 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from sensor_msgs.msg import CompressedImage, Image
-from std_msgs.msg import String
+from std_msgs.msg import String, Header
 
 import tensorrt as trt
 from cuda import cudart  # CUDA-Python wrapper (JetPack 6.x / CUDA 12.x)
 
 # ============================== Saját konfig ================================
-# Preferáld a csomagnevű importot; fallback standalone futtatásra.
 try:
     from yolopx.config import (
         ENGINE,
         TOPIC,
         RELIABLE,
-        SHOW,
         LANE_THRESH,
         DRIVE_THRESH,
         INPUT_W,
         INPUT_H,
         DEFAULT_INPUT_SHAPE,
-        WINDOW_TITLE,
         WATCHDOG_PERIOD_SEC,
         NO_FRAME_TIMEOUT_SEC,
+        OUT_TOPIC,
+        OUT_SCALE,
+        FRAME_ID,
     )
 except Exception:
-    # Minimális fallback, ha a config nincs csomagban – állítsd be környezettel vagy itt.
-    ENGINE = str(Path("model.engine").resolve())
-    TOPIC = "/camera/image/compressed"
-    RELIABLE = True
-    SHOW = False
-    LANE_THRESH = 0.5
-    DRIVE_THRESH = 0.5
-    INPUT_W = 640
-    INPUT_H = 384
-    DEFAULT_INPUT_SHAPE = (1, 3, int(INPUT_H), int(INPUT_W))  # NCHW
-    WINDOW_TITLE = "YOLOPx TRT 10.3"
-    WATCHDOG_PERIOD_SEC = 1.0
-    NO_FRAME_TIMEOUT_SEC = 2.5
+    # Új: egységes kimeneti topic + skálázás (0.5 → szélesség/magasság felezés = ~negyed terület)
+    OUT_TOPIC = "/yolopx/mask"
+    OUT_SCALE = 0.25
+    FRAME_ID = "camera"
 
 # ============================== Type aliases ================================
 DevicePtr = int    # CUDA device pointer intként
@@ -75,7 +51,6 @@ CudaEvent = int    # CUDA event handle intként
 # ====================== CUDA helpers (tuple-first, byref-fallback) ======================
 
 def _cuda_err_code(e) -> int:
-    """Konvertál bármilyen CUDA hibakód reprezentációt egész értékké."""
     if isinstance(e, tuple):
         e = e[0]
     try:
@@ -85,11 +60,10 @@ def _cuda_err_code(e) -> int:
         try:
             return int(v)
         except Exception:
-            return 9999  # ismeretlen
+            return 9999
 
 
 def check_cuda(err) -> None:
-    """Felrobban (RuntimeError), ha a CUDA hívás nem success."""
     code = _cuda_err_code(err)
     ok = _cuda_err_code(cudart.cudaError_t.cudaSuccess)
     if code != ok:
@@ -97,7 +71,6 @@ def check_cuda(err) -> None:
 
 
 def cuda_stream_create() -> CudaStream:
-    """Létrehoz egy CUDA streamet és visszaadja a handle-t intként (12.x)."""
     try:
         err, stream = cudart.cudaStreamCreate()
         check_cuda(err)
@@ -221,7 +194,6 @@ def cuda_event_record(event: CudaEvent, stream: CudaStream) -> None:
 
 
 def cuda_event_elapsed_time(start_event: CudaEvent, stop_event: CudaEvent) -> float:
-    """Visszaadja az eltelt időt ms-ban a két event között."""
     try:
         err, ms = cudart.cudaEventElapsedTime(int(start_event), int(stop_event))
         check_cuda(err)
@@ -241,7 +213,6 @@ def cuda_event_elapsed_time(start_event: CudaEvent, stop_event: CudaEvent) -> fl
 # ============================== TRT helpers ===============================
 
 def trt_nptype(dtype: trt.DataType) -> np.dtype:
-    """TensorRT típus → numpy dtype leképezés (TRT 10.3 kompatibilis)."""
     mapping = {
         trt.DataType.FLOAT: np.float32,
         trt.DataType.HALF: np.float16,
@@ -249,7 +220,6 @@ def trt_nptype(dtype: trt.DataType) -> np.dtype:
         trt.DataType.INT32: np.int32,
         trt.DataType.BOOL: np.bool_,
     }
-    # UINT8 létezik 10.x-ben – ha igen, használjuk
     if hasattr(trt.DataType, "UINT8"):
         mapping[getattr(trt.DataType, "UINT8")] = np.uint8
     return np.dtype(mapping[dtype])
@@ -258,17 +228,11 @@ def trt_nptype(dtype: trt.DataType) -> np.dtype:
 # ============================== TensorRT Runner ==============================
 
 class TRT10Runner:
-    """Könnyű wrapper TensorRT 10.3 futtatáshoz + GPU-időmérés.
-
-    - name-based IO API (get_tensor_name/mode/shape, set_input_shape, set_tensor_address)
-    - execute_async_v3
-    """
 
     def __init__(self, engine_path: str, default_shape: Tuple[int, int, int, int]):
         self.logger = trt.Logger(trt.Logger.INFO)
         self.runtime = trt.Runtime(self.logger)
 
-        # Engine betöltés
         with open(engine_path, "rb") as f:
             engine_bytes = f.read()
         self.engine: trt.ICudaEngine | None = self.runtime.deserialize_cuda_engine(engine_bytes)
@@ -279,10 +243,8 @@ class TRT10Runner:
         if self.context is None:
             raise RuntimeError("Nem sikerült létrehozni az execution contextet")
 
-        # IO tenso­rok listázása (TRT 10.x)
         self.input_names: List[str] = []
         self.output_names: List[str] = []
-        # TRT 10.3-on elérhető a num_io_tensors + get_tensor_name/mode
         for i in range(int(self.engine.num_io_tensors)):
             name = self.engine.get_tensor_name(i)
             if self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
@@ -292,7 +254,6 @@ class TRT10Runner:
         if len(self.input_names) != 1:
             raise RuntimeError(f"Pontosan 1 inputot várunk, most: {self.input_names}")
 
-        # Input shape beállítása, ha dinamikus
         in_name = self.input_names[0]
         in_shape = list(self.engine.get_tensor_shape(in_name))
         if any(d < 0 for d in in_shape):
@@ -300,17 +261,14 @@ class TRT10Runner:
             if not ok:
                 raise RuntimeError(f"set_input_shape({in_name}, {default_shape}) sikertelen")
 
-        # CUDA stream + timing eventek
         self.stream: CudaStream = cuda_stream_create()
         self._ev_start: CudaEvent = cuda_event_create()
         self._ev_stop: CudaEvent = cuda_event_create()
 
-        # Host/Device bufferek
         self.host: Dict[str, np.ndarray] = {}
         self.dev: Dict[str, DevicePtr] = {}
         self.shapes: Dict[str, Tuple[int, ...]] = {}
 
-        # A contextből kérdezzük a végleges shape-et
         for name in self.input_names + self.output_names:
             shape = tuple(self.context.get_tensor_shape(name))
             if any(d < 0 for d in shape):
@@ -320,13 +278,11 @@ class TRT10Runner:
             self.host[name] = np.empty(int(np.prod(shape)), dtype=dtype)
             self.dev[name] = cuda_malloc(self.host[name].nbytes)
 
-        # Device címek bekötése a kontextusba
         for name in self.input_names + self.output_names:
             ok = self.context.set_tensor_address(name, int(self.dev[name]))
             if not ok:
                 raise RuntimeError(f"set_tensor_address sikertelen: {name}")
 
-        # Kimeneti nevek felderítése (heurisztika + fallback)
         self.lane_name: str | None = None
         self.drive_name: str | None = None
         for n in self.output_names:
@@ -337,14 +293,12 @@ class TRT10Runner:
                 self.drive_name = n
         if self.lane_name is None or self.drive_name is None:
             if len(self.output_names) >= 2:
-                # stabil fallback: utolsó kettő
                 self.lane_name = self.output_names[-2]
                 self.drive_name = self.output_names[-1]
             else:
                 raise RuntimeError("Nincs elég kimenet a lane/drivable maphez")
 
     def close(self) -> None:
-        """GPU erőforrások felszabadítása (stream, device bufferek, eventek)."""
         try:
             for ptr in self.dev.values():
                 cuda_free(ptr)
@@ -361,7 +315,7 @@ class TRT10Runner:
             except Exception:
                 pass
 
-    def __del__(self):  # best-effort GC
+    def __del__(self):
         try:
             self.close()
         except Exception:
@@ -372,7 +326,6 @@ class TRT10Runner:
         return outs
 
     def infer_timed(self, nchw_fp32: np.ndarray) -> Tuple[Dict[str, np.ndarray], float]:
-        """Futtat egy lépést és visszaadja a kimeneteket + GPU időt (ms)."""
         in_name = self.input_names[0]
         expected_shape = self.shapes[in_name]
         if tuple(nchw_fp32.shape) != expected_shape:
@@ -380,27 +333,19 @@ class TRT10Runner:
         if nchw_fp32.dtype != np.float32:
             raise TypeError("Input dtype legyen float32")
 
-        # H2D
         self.host[in_name][...] = np.ravel(nchw_fp32, order="C")
         cuda_memcpy_htod_async(self.dev[in_name], self.host[in_name], self.stream)
 
-        # GPU timer start
         cuda_event_record(self._ev_start, self.stream)
-
-        # Exec (TRT 10.x)
         ok = self.context.execute_async_v3(stream_handle=int(self.stream))
         if not ok:
             raise RuntimeError("execute_async_v3 sikertelen")
-
-        # GPU timer stop
         cuda_event_record(self._ev_stop, self.stream)
 
-        # D2H + sync
         for name in self.output_names:
             cuda_memcpy_dtoh_async(self.host[name], self.dev[name], self.stream)
         cuda_stream_sync(self.stream)
 
-        # Elapsed ms (GPU csak a háló végrehajtása)
         gpu_ms = cuda_event_elapsed_time(self._ev_start, self._ev_stop)
 
         outs: Dict[str, np.ndarray] = {}
@@ -412,10 +357,6 @@ class TRT10Runner:
 # ================================= ROS2 Node =================================
 
 class InferenceNode(Node):
-    """ROS2 node: Image/CompressedImage → TRT → metrikák JSON.
-
-    Kifejezetten TensorRT 10.3-ra szabva Jetson Orinon.
-    """
 
     def __init__(self) -> None:
         super().__init__("yolopx_trt")
@@ -423,19 +364,14 @@ class InferenceNode(Node):
         self.get_logger().info(f"Engine: {ENGINE}")
         self.get_logger().info(f"Topic (base): {TOPIC}")
 
-        # Ellenőrzés: engine elérhető?
         if not ENGINE or not Path(ENGINE).exists():
             raise SystemExit(f"A configban megadott ENGINE nem található: {ENGINE}")
 
-        # TensorRT futtató
         self.trt_runner = TRT10Runner(ENGINE, default_shape=DEFAULT_INPUT_SHAPE)
 
-        # Küszöbök és megjelenítés kapcsoló
         self.lane_thresh = float(LANE_THRESH)
         self.drive_thresh = float(DRIVE_THRESH)
-        self.show = bool(SHOW)
 
-        # QoS beállítás a configból
         qos = QoSProfile(depth=1)
         qos.history = HistoryPolicy.KEEP_LAST
         qos.reliability = ReliabilityPolicy.RELIABLE if RELIABLE else ReliabilityPolicy.BEST_EFFORT
@@ -448,20 +384,22 @@ class InferenceNode(Node):
         else:
             self._raw_topic = TOPIC
             self._cmp_topic = TOPIC.rstrip('/') + '/compressed'
-        self._sub = None              # aktuális aktív subscription objektum
-        self._current_kind = None     # 'compressed' | 'raw' | None
+        self._sub = None
+        self._current_kind = None
         self._ensure_best_subscription()
 
-        # Bootstrap: sűrű újravizsgálat indulás után
-        self._bootstrap_scans_left = 15   # ~7.5s, ha 0.5s period
+        self._bootstrap_scans_left = 15
         self._bootstrap_timer = self.create_timer(0.5, self._bootstrap_rescan)
 
-        # Watchdog állapot
         self.last_frame_time: float | None = None
         self.frame_count: int = 0
         self.create_timer(WATCHDOG_PERIOD_SEC, self._watchdog)
 
-        # ---- METRICS: publisher + állapotok (EMA) ----
+        # ---- EGYETLEN KIMENETI PUBLISHER: SZÍNES OVERLAY (BGR8) ----
+        self.pub_mask = self.create_publisher(Image, OUT_TOPIC, 10)
+        self.get_logger().info(f"Publikálás: overlay (bgr8) -> {OUT_TOPIC}")
+
+        # ---- METRICS ----
         self.metrics_pub = self.create_publisher(String, f"{self.get_name()}/metrics_json", 10)
         self.get_logger().info(f"Metrikák topic: /{self.get_name()}/metrics_json")
 
@@ -469,12 +407,11 @@ class InferenceNode(Node):
         self._last_proc_t: float | None = None
         self._in_fps_ema: float = 0.0
         self._out_fps_ema: float = 0.0
-        self._alpha: float = 0.1  # EMA simítás
+        self._alpha: float = 0.1
         self.get_logger().info("Node készen áll. Várjuk a frame-eket…")
 
     # --------------------------- Dinamikus választó -----------------------------
     def _ensure_best_subscription(self) -> None:
-        """Preferáld a CompressedImage-et; ha megjelenik, válts át rá."""
         name_types = {name: types for name, types in self.get_topic_names_and_types()}
         IMG_T = 'sensor_msgs/msg/Image'
         CMP_T = 'sensor_msgs/msg/CompressedImage'
@@ -538,7 +475,6 @@ class InferenceNode(Node):
 
     # ----------------------------- Preprocess -------------------------------
     def _preprocess(self, bgr: np.ndarray) -> np.ndarray:
-        """Előkészíti a BGR képet a háló számára (NCHW FP32, 0..1, INPUT_W×INPUT_H)."""
         resized = cv2.resize(bgr, (int(INPUT_W), int(INPUT_H)), interpolation=cv2.INTER_LINEAR)
         img = resized.astype(np.float32) / 255.0
         img = np.transpose(img, (2, 0, 1))[None, ...]  # (1, 3, H, W)
@@ -551,7 +487,6 @@ class InferenceNode(Node):
         return frame
 
     def _decode_image(self, msg: Image) -> np.ndarray | None:
-        """sensor_msgs/Image → BGR np.ndarray (bgr8, rgb8, mono8, mono16)."""
         h, w = int(msg.height), int(msg.width)
         step = int(msg.step)
         enc = (msg.encoding or "").lower()
@@ -570,7 +505,7 @@ class InferenceNode(Node):
                 return arr.copy()
             if enc in ("rgb8",):
                 arr = rows_as(w * 3, np.uint8).reshape(h, w, 3)
-                return arr[..., ::-1].copy()  # RGB→BGR
+                return arr[..., ::-1].copy()
             if enc in ("mono8", "8uc1", "mono8; compressed"):
                 arr = rows_as(w, np.uint8).reshape(h, w)
                 return cv2.cvtColor(arr, cv2.COLOR_GRAY2BGR)
@@ -598,7 +533,6 @@ class InferenceNode(Node):
         if frame is None:
             return
 
-        # OUT FPS (EMA) az egymást követő feldolgozásokból
         now = time.perf_counter()
         if self._last_proc_t is not None:
             dt = now - self._last_proc_t
@@ -621,22 +555,33 @@ class InferenceNode(Node):
 
         lane_m = (lane > self.lane_thresh).astype(np.uint8)
         drive_m = (drive > self.drive_thresh).astype(np.uint8)
-        drive_m = drive_m * (1 - lane_m)
+        drive_m = drive_m * (1 - lane_m)  # kizáró osztályok
 
         h, w = frame.shape[:2]
         lane_m = cv2.resize(lane_m, (w, h), interpolation=cv2.INTER_NEAREST)
         drive_m = cv2.resize(drive_m, (w, h), interpolation=cv2.INTER_NEAREST)
 
-        # e2e idő (vizualizáció nélkül)
+        # === SZÍNES OVERLAY mint az imshow-ban: drive=piros, lane=zöld ===
+        overlay = np.zeros_like(frame)
+        overlay[drive_m == 1] = (0, 0, 255)
+        overlay[lane_m == 1]  = (0, 255, 0)
+        vis = cv2.addWeighted(frame, 0.6, overlay, 0.4, 0)
+
+        # === LEKICSINYÍTÉS a kimenetre (alap: OUT_SCALE=0.5 → fele szél/mag, negyed terület) ===
+        scale = float(OUT_SCALE)
+        if not (0.0 < scale <= 1.0):
+            self.get_logger().warn(f"OUT_SCALE={scale} kívül esik (0,1] tartományon, 1.0-ra állítom")
+            scale = 1.0
+        out_w = max(1, int(round(w * scale)))
+        out_h = max(1, int(round(h * scale)))
+        if out_w != w or out_h != h:
+            vis = cv2.resize(vis, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
+
         e2e_ms = (time.perf_counter() - t0) * 1000.0
 
-        if self.show:
-            overlay = np.zeros_like(frame)
-            overlay[drive_m == 1] = (0, 0, 255)  # drivable = piros (BGR)
-            overlay[lane_m == 1] = (0, 255, 0)  # lane = zöld
-            out = cv2.addWeighted(frame, 0.6, overlay, 0.4, 0)
-            cv2.imshow(WINDOW_TITLE, out)
-            cv2.waitKey(1)
+        # Publikálás: bgr8 overlay
+        msg = self._bgr8_to_image_msg(vis)
+        self.pub_mask.publish(msg)
 
         self._publish_metrics(e2e_ms=e2e_ms, gpu_ms=gpu_ms)
 
@@ -653,10 +598,44 @@ class InferenceNode(Node):
             return arr
         raise ValueError(f"Váratlan output shape: {arr.shape}")
 
+    # --------------------------- Numpy → Image msg --------------------------
+    def _mono8_to_image_msg(self, mono: np.ndarray) -> Image:
+        if mono.dtype != np.uint8:
+            mono = mono.astype(np.uint8)
+        msg = Image()
+        msg.header = Header()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = FRAME_ID
+        h, w = mono.shape[:2]
+        msg.height = int(h)
+        msg.width = int(w)
+        msg.encoding = 'mono8'
+        msg.is_bigendian = 0
+        msg.step = int(w)
+        msg.data = mono.tobytes()
+        return msg
+
+    def _bgr8_to_image_msg(self, bgr: np.ndarray) -> Image:
+        if bgr.dtype != np.uint8:
+            bgr = bgr.astype(np.uint8)
+        if bgr.ndim != 3 or bgr.shape[2] != 3:
+            raise ValueError("bgr8 message expects HxWx3 array")
+        msg = Image()
+        msg.header = Header()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = FRAME_ID
+        h, w = bgr.shape[:2]
+        msg.height = int(h)
+        msg.width = int(w)
+        msg.encoding = 'bgr8'
+        msg.is_bigendian = 0
+        msg.step = int(w) * 3
+        msg.data = bgr.tobytes()
+        return msg
+
     # --------------------------- ROS2 callbackok ----------------------------
     def _image_cb_compressed(self, msg: CompressedImage) -> None:
         try:
-            # bejövő FPS (EMA) – inter-arrival alapján
             now = time.perf_counter()
             if self._last_in_stamp is not None:
                 dt = now - self._last_in_stamp
@@ -675,7 +654,6 @@ class InferenceNode(Node):
 
     def _image_cb_raw(self, msg: Image) -> None:
         try:
-            # bejövő FPS (EMA) – inter-arrival alapján
             now = time.perf_counter()
             if self._last_in_stamp is not None:
                 dt = now - self._last_in_stamp
@@ -703,7 +681,7 @@ class InferenceNode(Node):
                 "latency_ms_gpu": round(float(gpu_ms), 2),
                 "proc_ratio": round(proc_ratio, 2),
                 "frames": int(self.frame_count),
-                "show": bool(self.show),
+                "out_scale": float(OUT_SCALE),
             }
             self.metrics_pub.publish(String(data=json.dumps(m)))
         except Exception as e:
@@ -713,7 +691,6 @@ class InferenceNode(Node):
 # ================================== main ===================================
 
 def main() -> None:
-    """Belépési pont: ROS2 init, node létrehozás, spin, elegáns shutdown."""
     rclpy.init(args=None)
     node = InferenceNode()
 
@@ -730,10 +707,6 @@ def main() -> None:
         try:
             if rclpy.ok():
                 rclpy.shutdown()
-        except Exception:
-            pass
-        try:
-            cv2.destroyAllWindows()
         except Exception:
             pass
 
