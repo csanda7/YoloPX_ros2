@@ -835,6 +835,9 @@ class TRT10Runner:
     """Könnyű wrapper TensorRT 10.9/13 futtatáshoz + GPU-időmérés."""
 
     def __init__(self, engine_path: str, default_shape: Tuple[int, int, int, int]):
+    # Megjegyzés: NE hozz létre ilyen objektumot minden callback-ben/spin ciklusban!
+    # Drága műveletek (engine deszerializálás + execution context létrehozás).
+    # Használj folyamat‑szintű cache-t (lásd a fájl vége felé: get_trt_runner).        
         self.logger = trt.Logger(trt.Logger.INFO)
         self.runtime = trt.Runtime(self.logger)
 
@@ -940,6 +943,8 @@ class TRT10Runner:
 
     def infer_timed(self, nchw_fp32: np.ndarray) -> Tuple[Dict[str, np.ndarray], float]:
         """Ugyanaz, mint infer(), de visszaadja a GPU-oldali inferencia idejét ms-ban."""
+    # (Opcionális) Thread-safety: ha több callback szál hívhatja párhuzamosan, tekerd lock-kal.
+    # Egyszerűség kedvéért itt nem alkalmazunk globális lockot; hozz létre szükség esetén.
         in_name = self.input_names[0]
         expected_shape = self.shapes[in_name]
         if tuple(nchw_fp32.shape) != expected_shape:
@@ -973,6 +978,36 @@ class TRT10Runner:
             outs[name] = self.host[name].reshape(self.shapes[name]).copy()
         return outs, float(gpu_ms)
 
+# ===== Global TRT runner cache (engine → exactly one runner per process) =====
+import threading, atexit
+_TRT_CACHE_LOCK = threading.Lock()
+_TRT_CACHE: Dict[Tuple[str, Tuple[int,int,int,int]], TRT10Runner] = {}
+
+def get_trt_runner(engine_path: str, default_shape: Tuple[int,int,int,int]) -> TRT10Runner:
+    """Visszaad egy megosztott (singleton-szerű) TRT10Runner példányt ugyanarra az engine-re.
+
+    Kulcs: (abs(engine_path), default_shape). Így több ROS2 *Node* ugyanabban a folyamatban
+    nem deszerializálja újra és újra az engine-t, és nem hoz létre több execution contextet.
+    """
+    key = (str(Path(engine_path).resolve()), tuple(default_shape))
+    with _TRT_CACHE_LOCK:
+        r = _TRT_CACHE.get(key)
+        if r is None:
+            print(f"[TRT] Creating runtime/engine/context ONCE for {key[0]}")
+            r = TRT10Runner(key[0], default_shape)
+            _TRT_CACHE[key] = r
+        return r
+
+def _cleanup_trt_cache():
+    for r in list(_TRT_CACHE.values()):
+        try:
+            r.close()
+        except Exception:
+            pass
+    _TRT_CACHE.clear()
+
+atexit.register(_cleanup_trt_cache)
+
 # ================================= ROS2 Node =================================
 
 class InferenceNode(Node):
@@ -989,8 +1024,8 @@ class InferenceNode(Node):
         if not ENGINE or not Path(ENGINE).exists():
             raise SystemExit(f"A configban megadott ENGINE nem található: {ENGINE}")
 
-        # TensorRT futtató inicializálása
-        self.trt_runner = TRT10Runner(ENGINE, default_shape=DEFAULT_INPUT_SHAPE)
+        # TensorRT futtató inicializálása (MEGOSZTOTT, egyszeri létrehozás folyamatszinten)
+        self.trt_runner = get_trt_runner(ENGINE, DEFAULT_INPUT_SHAPE)
 
         # Küszöbök és megjelenítés kapcsoló a configból
         self.lane_thresh = float(LANE_THRESH)
@@ -1310,10 +1345,8 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
-        try:
-            node.trt_runner.close()
-        except Exception:
-            pass
+    # Ne zárd le expliciten a trt_runner-t: megosztott cache-ből jön. A folyamat
+    # végén az atexit handler (_cleanup_trt_cache) felszabadítja az erőforrásokat.
         node.destroy_node()
         try:
             if rclpy.ok():

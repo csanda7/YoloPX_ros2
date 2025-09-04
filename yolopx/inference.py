@@ -105,9 +105,9 @@ class InferenceNode(Node):
         self._in_fps_ema: float = 0.0
         self._out_fps_ema: float = 0.0
         self._alpha: float = 0.1
-    self.get_logger().info("Node készen áll. Várjuk a frame-eket…")
-    # Polling timer pipeline fetch-hez
-    self._poll_timer = self.create_timer(0.0, self._poll_pipeline)
+        self.get_logger().info("Node készen áll. Várjuk a frame-eket…")
+        # Polling timer pipeline fetch-hez
+        self._poll_timer = self.create_timer(0.0, self._poll_pipeline)
 
     # --------------------------- Dinamikus választó -----------------------------
     def _ensure_best_subscription(self) -> None:

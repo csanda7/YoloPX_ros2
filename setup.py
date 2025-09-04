@@ -21,7 +21,7 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'seg_sub_trt = yolopx.seg_sub_trt:main'
+            'inference = yolopx.inference:main'
         ],
     },
 )
