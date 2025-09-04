@@ -1,5 +1,5 @@
 # ------------------------------ Model & IO ---------------------------------
-ENGINE: str = "/home/csanda/Work/JKK/ros2/yolopx/models/yolopx_2.engine"  
+ENGINE: str = "//home/csanda/Work/JKK/ros2/yolopx/models/yolopx5.engine"  
 TOPIC: str = "/zed2i/zed_node/left/image_rect_color"
 RELIABLE: bool = False  
 SHOW: bool = True       #opencv ablak
@@ -17,3 +17,9 @@ DEFAULT_INPUT_SHAPE = (1, 3, INPUT_H, INPUT_W)
 WINDOW_TITLE: str = "YOLOPX Inference"
 WATCHDOG_PERIOD_SEC: float = 1.0
 NO_FRAME_TIMEOUT_SEC: float = 2.5
+
+OUT_TOPIC = "/yolopx/mask"
+OUT_SCALE = 0.25        # 0<scale≤1; 0.5 → fele szél/mag, ~negyed terület
+FRAME_ID = "camera"
+VIS_MODE = "overlay"   # vagy "palette" (olcsóbb)
+PREFER_COMPRESSED = True  # CPU kímélés: raw Image preferált, ha elérhető
