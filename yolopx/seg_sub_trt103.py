@@ -5,6 +5,8 @@ from __future__ import annotations
 import ctypes
 import time
 import json
+import threading
+import atexit
 from pathlib import Path
 from typing import Dict, Tuple, List
 
@@ -21,7 +23,6 @@ import tensorrt as trt
 from cuda import cudart  # CUDA-Python wrapper (JetPack 6.x / CUDA 12.x)
 
 # ============================== Saját konfig ================================
-
 from yolopx.config import (
     ENGINE,
     TOPIC,
@@ -36,10 +37,8 @@ from yolopx.config import (
     OUT_TOPIC,
     OUT_SCALE,
     FRAME_ID,
-    VIS_MODE,        # "overlay" vagy "palette"
-    PREFER_COMPRESSED
-    )
-
+    VIS_MODE,         # "overlay" vagy "palette"
+)
 
 # ============================== Type aliases ================================
 DevicePtr = int    # CUDA device pointer intként
@@ -260,11 +259,19 @@ def trt_nptype(dtype: trt.DataType) -> np.dtype:
 # ============================== TensorRT Runner ==============================
 
 class TRT10Runner:
+    """
+    Egy engine + context + saját stream + saját (pinned) host bufferek + device bufferek.
+    Ezt SINGLETON-szerűen (folyamat-szinten) reuse-oljuk – lásd get_trt_runner().
+    Thread-safe az infer_timed() egy belső lockkal.
+    """
 
     def __init__(self, engine_path: str, default_shape: Tuple[int, int, int, int]):
+        self._infer_lock = threading.Lock()
+
         self.logger = trt.Logger(trt.Logger.INFO)
         self.runtime = trt.Runtime(self.logger)
 
+        # Engine betöltés
         with open(engine_path, "rb") as f:
             engine_bytes = f.read()
         self.engine: trt.ICudaEngine | None = self.runtime.deserialize_cuda_engine(engine_bytes)
@@ -275,6 +282,7 @@ class TRT10Runner:
         if self.context is None:
             raise RuntimeError("Nem sikerült létrehozni az execution contextet")
 
+        # IO tensorok
         self.input_names: List[str] = []
         self.output_names: List[str] = []
         for i in range(int(self.engine.num_io_tensors)):
@@ -286,6 +294,7 @@ class TRT10Runner:
         if len(self.input_names) != 1:
             raise RuntimeError(f"Pontosan 1 inputot várunk, most: {self.input_names}")
 
+        # Dinamikus shape feloldás
         in_name = self.input_names[0]
         in_shape = list(self.engine.get_tensor_shape(in_name))
         if any(d < 0 for d in in_shape):
@@ -293,6 +302,7 @@ class TRT10Runner:
             if not ok:
                 raise RuntimeError(f"set_input_shape({in_name}, {default_shape}) sikertelen")
 
+        # CUDA erőforrások
         self.stream: CudaStream = cuda_stream_create()
         self._ev_start: CudaEvent = cuda_event_create()
         self._ev_stop: CudaEvent = cuda_event_create()
@@ -315,6 +325,7 @@ class TRT10Runner:
             self._host_pinned_ptrs[name] = ptr
             self.dev[name] = cuda_malloc(self.host[name].nbytes)
 
+        # Device címek bekötése
         for name in self.input_names + self.output_names:
             ok = self.context.set_tensor_address(name, int(self.dev[name]))
             if not ok:
@@ -364,50 +375,83 @@ class TRT10Runner:
         except Exception:
             pass
 
-    def infer(self, nchw_fp32: np.ndarray) -> Dict[str, np.ndarray]:
-        outs, _ = self.infer_timed(nchw_fp32)
+    def infer(self, nchw_fp32: np.ndarray, copy_outputs: bool = True) -> Dict[str, np.ndarray]:
+        outs, _ = self.infer_timed(nchw_fp32, copy_outputs=copy_outputs)
         return outs
 
-    def infer_timed(self, nchw_fp32: np.ndarray) -> Tuple[Dict[str, np.ndarray], float]:
-        in_name = self.input_names[0]
-        expected_shape = self.shapes[in_name]
-        if tuple(nchw_fp32.shape) != expected_shape:
-            raise ValueError(f"Input shape {nchw_fp32.shape} != várt {expected_shape}")
-        if nchw_fp32.dtype != np.float32:
-            raise TypeError("Input dtype legyen float32")
+    def infer_timed(self, nchw_fp32: np.ndarray | None, copy_outputs: bool = True) -> Tuple[Dict[str, np.ndarray], float]:
+        """Inference.
 
-        # H2D
-        self.host[in_name][...] = np.ravel(nchw_fp32, order="C")
-        cuda_memcpy_htod_async(self.dev[in_name], self.host[in_name], self.stream)
+        Ha nchw_fp32 None, akkor feltételezzük, hogy a host input buffer már fel van töltve
+        (pl. közvetlen preprocess során). Ellenkező esetben bemásoljuk.
+        copy_outputs=False esetén a visszaadott ndarra y-ok a belső pinned host
+        bufferekre mutatnak (KÖVETKEZŐ inference felülírja), így csak rövid ideig használjuk.
+        """
+        with self._infer_lock:
+            in_name = self.input_names[0]
+            expected_shape = self.shapes[in_name]
 
-        # GPU exec
-        cuda_event_record(self._ev_start, self.stream)
-        ok = self.context.execute_async_v3(stream_handle=int(self.stream))
-        if not ok:
-            raise RuntimeError("execute_async_v3 sikertelen")
-        cuda_event_record(self._ev_stop, self.stream)
+            if nchw_fp32 is not None:
+                if tuple(nchw_fp32.shape) != expected_shape:
+                    raise ValueError(f"Input shape {nchw_fp32.shape} != várt {expected_shape}")
+                if nchw_fp32.dtype != np.float32:
+                    raise TypeError("Input dtype legyen float32")
+                # H2D source a kapott tömb -> host[input] -> device
+                self.host[in_name][...] = np.ravel(nchw_fp32, order="C")
 
-        # D2H + sync
-        for name in self.output_names:
-            cuda_memcpy_dtoh_async(self.host[name], self.dev[name], self.stream)
-        cuda_stream_sync(self.stream)
+            # Mindkét esetben host[input] tartalmazza az adatot, mehet H2D
+            cuda_memcpy_htod_async(self.dev[in_name], self.host[in_name], self.stream)
 
-        gpu_ms = cuda_event_elapsed_time(self._ev_start, self._ev_stop)
+            # GPU exec
+            cuda_event_record(self._ev_start, self.stream)
+            ok = self.context.execute_async_v3(stream_handle=int(self.stream))
+            if not ok:
+                raise RuntimeError("execute_async_v3 sikertelen")
+            cuda_event_record(self._ev_stop, self.stream)
 
-        outs: Dict[str, np.ndarray] = {}
-        for name in self.output_names:
-            outs[name] = self.host[name].reshape(self.shapes[name]).copy()
-        return outs, float(gpu_ms)
+            # D2H + sync
+            for name in self.output_names:
+                cuda_memcpy_dtoh_async(self.host[name], self.dev[name], self.stream)
+            cuda_stream_sync(self.stream)
+
+            gpu_ms = cuda_event_elapsed_time(self._ev_start, self._ev_stop)
+
+            outs: Dict[str, np.ndarray] = {}
+            if copy_outputs:
+                for name in self.output_names:
+                    outs[name] = self.host[name].reshape(self.shapes[name]).copy()
+            else:
+                for name in self.output_names:
+                    outs[name] = self.host[name].reshape(self.shapes[name])
+            return outs, float(gpu_ms)
 
 
-# ===== Global singleton for TRT runner (avoid re-creating execution context) =====
-_GLOBAL_TRT_RUNNER: TRT10Runner | None = None
+# ===== Global TRT runner cache (engine → exactly one runner per process) =====
+_TRT_CACHE_LOCK = threading.Lock()
+_TRT_CACHE: Dict[Tuple[str, Tuple[int,int,int,int]], TRT10Runner] = {}
 
 def get_trt_runner(engine_path: str, default_shape: Tuple[int,int,int,int]) -> TRT10Runner:
-    global _GLOBAL_TRT_RUNNER
-    if _GLOBAL_TRT_RUNNER is None:
-        _GLOBAL_TRT_RUNNER = TRT10Runner(engine_path, default_shape)
-    return _GLOBAL_TRT_RUNNER
+    key = (str(Path(engine_path).resolve()), tuple(default_shape))
+    with _TRT_CACHE_LOCK:
+        r = _TRT_CACHE.get(key)
+        if r is None:
+            print(f"[TRT] Creating runtime/engine/context ONCE for {key[0]}")
+            r = TRT10Runner(key[0], default_shape)
+            _TRT_CACHE[key] = r
+        else:
+            # debug log
+            pass
+        return r
+
+def _cleanup_trt_cache():
+    for r in list(_TRT_CACHE.values()):
+        try:
+            r.close()
+        except Exception:
+            pass
+    _TRT_CACHE.clear()
+
+atexit.register(_cleanup_trt_cache)
 
 # ================================= ROS2 Node =================================
 
@@ -422,6 +466,7 @@ class InferenceNode(Node):
         if not ENGINE or not Path(ENGINE).exists():
             raise SystemExit(f"A configban megadott ENGINE nem található: {ENGINE}")
 
+        # !!! Single process-wide shared runner (context)!
         self.trt_runner = get_trt_runner(ENGINE, DEFAULT_INPUT_SHAPE)
 
         self.lane_thresh = float(LANE_THRESH)
@@ -431,7 +476,7 @@ class InferenceNode(Node):
         qos.history = HistoryPolicy.KEEP_LAST
         qos.reliability = ReliabilityPolicy.RELIABLE if RELIABLE else ReliabilityPolicy.BEST_EFFORT
 
-        # --- Preferált feliratkozás (raw vs compressed) CPU szempontból ---
+        # --- Dinamikus, preferált feliratkozás (compressed > raw) ---
         self._qos = qos
         if TOPIC.endswith('/compressed'):
             self._raw_topic = TOPIC[: -len('/compressed')] or '/'
@@ -535,21 +580,31 @@ class InferenceNode(Node):
 
     # ----------------------------- Preprocess -------------------------------
     def _preprocess(self, bgr: np.ndarray) -> np.ndarray:
-        # CPU: a bemenetet a háló elvárásaihoz igazítjuk (kicsi, így olcsó)
-        resized = cv2.resize(bgr, (int(INPUT_W), int(INPUT_H)), interpolation=cv2.INTER_LINEAR)
-        img = resized.astype(np.float32) / 255.0
-        img = np.transpose(img, (2, 0, 1))[None, ...]  # (1, 3, H, W)
-        return img
+        # EREDETI: új tömb létrehozása minden frame-nél.
+        # OPT: közvetlenül a runner pinned host input bufferébe írunk, így nincs extra másolat.
+        in_name = self.trt_runner.input_names[0]
+        shp = self.trt_runner.shapes[in_name]  # (1,3,H,W)
+        _, c, h, w = shp
+        assert c == 3, "Csak 3 csatornás bgr támogatott"
+        host_view = self.trt_runner.host[in_name].reshape(shp)
+
+        resized = cv2.resize(bgr, (w, h), interpolation=cv2.INTER_LINEAR)
+        # float32 normalizálás (1/255)
+        rf = resized.astype(np.float32)
+        rf *= (1.0/255.0)
+        # Csatornák átmásolása NCHW (N=1)
+        host_view[0, 0, :, :] = rf[:, :, 0]
+        host_view[0, 1, :, :] = rf[:, :, 1]
+        host_view[0, 2, :, :] = rf[:, :, 2]
+        return host_view  # visszaadjuk a shape ellenőrzés kedvéért (nem kötelező)
 
     # ----------------------------- Decoderek --------------------------------
     def _decode_compressed(self, msg: CompressedImage) -> np.ndarray | None:
-        # JPEG dekódolás CPU-n: ha tudsz, preferáld a raw topikot
         np_arr = np.frombuffer(msg.data, np.uint8)
         frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
         return frame
 
     def _decode_image(self, msg: Image) -> np.ndarray | None:
-        # raw Image → BGR; ez CPU-barátabb, mint JPEG decode
         h, w = int(msg.height), int(msg.width)
         step = int(msg.step)
         enc = (msg.encoding or "").lower()
@@ -616,11 +671,17 @@ class InferenceNode(Node):
         self.last_frame_time = time.time()
 
         t0 = time.perf_counter()
-        inp = self._preprocess(frame)
-        outs, gpu_ms = self.trt_runner.infer_timed(inp)
+        # Preprocess közvetlenül pinned host bufferbe
+        self._preprocess(frame)
+        # Már a host bufferben az input → nchw_fp32=None + copy_outputs=False
+        outs, gpu_ms = self.trt_runner.infer_timed(None, copy_outputs=False)
 
-        lane_raw = outs[self.trt_runner.lane_name].astype(np.float32)
-        drive_raw = outs[self.trt_runner.drive_name].astype(np.float32)
+        lane_raw = outs[self.trt_runner.lane_name]
+        if lane_raw.dtype != np.float32:
+            lane_raw = lane_raw.astype(np.float32)
+        drive_raw = outs[self.trt_runner.drive_name]
+        if drive_raw.dtype != np.float32:
+            drive_raw = drive_raw.astype(np.float32)
         lane = self._select_map(lane_raw)
         drive = self._select_map(drive_raw)
 
@@ -645,7 +706,6 @@ class InferenceNode(Node):
         if VIS_MODE.lower() == "palette":
             # 0=black, 1=green, 2=red (BGR) – LUT
             combined = (lane_s.astype(np.uint8) * 1) + (drive_s.astype(np.uint8) * 2)
-            # In-place töltés a _vis-be (kevesebb allo)
             self._vis[:, :, :] = self._lut[combined]
         else:
             # overlay mód: frame kicsinyítése AREA-val + maszkolt színek
@@ -653,7 +713,7 @@ class InferenceNode(Node):
 
             ov = self._overlay
             ov.fill(0)
-            # Zöld csatorna = lane * 255 (in-place skálázás, nincs új tömb)
+            # Zöld csatorna = lane * 255
             ov[..., 1] = lane_s
             np.multiply(ov[..., 1], 255, out=ov[..., 1], casting='unsafe')
             # Piros csatorna = drive * 255
@@ -661,7 +721,8 @@ class InferenceNode(Node):
             np.multiply(ov[..., 2], 255, out=ov[..., 2], casting='unsafe')
 
             # addWeighted kimenet a _vis-be
-            self._vis = cv2.addWeighted(frame_s, 0.6, ov, 0.4, 0.0)
+            # addWeighted meglévő bufferbe (dst) – nincs új allokáció
+            cv2.addWeighted(frame_s, 0.6, ov, 0.4, 0.0, dst=self._vis)
 
         e2e_ms = (time.perf_counter() - t0) * 1000.0
 
@@ -742,7 +803,15 @@ class InferenceNode(Node):
 
     # ------------------------------ Metrics pub ------------------------------
     def _publish_metrics(self, e2e_ms: float, gpu_ms: float) -> None:
+        # Ritkítás: max ~5 Hz (CPU kímélés)
         try:
+            now = time.perf_counter()
+            if not hasattr(self, "_metrics_last_pub"):
+                self._metrics_last_pub = 0.0
+            if (now - self._metrics_last_pub) < 0.2:  # 5 Hz
+                return
+            self._metrics_last_pub = now
+
             proc_ratio = (self._out_fps_ema / self._in_fps_ema) if self._in_fps_ema > 0 else 0.0
             m = {
                 "in_fps": round(self._in_fps_ema, 2),
@@ -753,7 +822,6 @@ class InferenceNode(Node):
                 "frames": int(self.frame_count),
                 "out_scale": float(OUT_SCALE),
                 "vis_mode": str(VIS_MODE),
-                "prefer_compressed": bool(PREFER_COMPRESSED)
             }
             self.metrics_pub.publish(String(data=json.dumps(m)))
         except Exception as e:
@@ -771,6 +839,7 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        # NE zárd le itt a trt_runner-t – közös singleton! Folyamat végén az atexit felszabadít.
         node.destroy_node()
         try:
             if rclpy.ok():
