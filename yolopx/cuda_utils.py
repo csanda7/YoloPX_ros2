@@ -1,7 +1,3 @@
-"""CUDA helper függvények és típus aliasok.
-
-Leválasztva a fő node kódról a jobb olvashatóság érdekében.
-"""
 from __future__ import annotations
 import ctypes
 from typing import Tuple

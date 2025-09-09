@@ -315,7 +315,8 @@ class InferenceNode(Node):
         rf = resized.astype(np.float32); rf *= (1.0/255.0)
         host_view[0,0,:,:] = rf[:,:,0]; host_view[0,1,:,:] = rf[:,:,1]; host_view[0,2,:,:] = rf[:,:,2]
         slot.frame = frame
-        self.pipeline.enqueue(slot, host_view, measure_timing=False)
+        # GPU idő mérés engedélyezve (measure_timing=True) a valós gpu_ms publikálásához
+        self.pipeline.enqueue(slot, host_view, measure_timing=True)
 
     def _poll_pipeline(self) -> None:
         if self.pipeline is None:
@@ -438,7 +439,6 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
-        # NE zárd le itt a trt_runner-t – közös singleton! Folyamat végén az atexit felszabadít.
         node.destroy_node()
         try:
             if rclpy.ok():

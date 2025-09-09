@@ -286,7 +286,7 @@ class TRTPipelineRunner:
         később poll/fetch: outs = pipe.fetch_ready(copy_outputs=False)
     """
 
-    def __init__(self, base: TRT10Runner, num_slots: int = 2):
+    def __init__(self, base: TRT10Runner, num_slots: int = 3):
         from .cuda_utils import (
             pinned_empty_1d, cuda_malloc, cuda_stream_create, cuda_event_create,
             cuda_memcpy_htod_async, cuda_memcpy_dtoh_async, cuda_stream_sync,
@@ -363,7 +363,7 @@ class TRTPipelineRunner:
                 return s
         return None
 
-    def enqueue(self, slot: TRTPipelineSlot, nchw: np.ndarray, measure_timing: bool = False) -> None:
+    def enqueue(self, slot: TRTPipelineSlot, nchw: np.ndarray, measure_timing: bool = True) -> None:
         if slot.busy:
             raise RuntimeError("Slot already busy")
         if tuple(nchw.shape) != self._input_shape:
