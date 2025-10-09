@@ -25,8 +25,6 @@ from yolopx.config import (
     RELIABLE,
     LANE_THRESH,
     DRIVE_THRESH,
-    INPUT_W,
-    INPUT_H,
     DEFAULT_INPUT_SHAPE,
     WATCHDOG_PERIOD_SEC,
     NO_FRAME_TIMEOUT_SEC,
@@ -34,9 +32,10 @@ from yolopx.config import (
     OUT_SCALE,
     FRAME_ID,
     VIS_MODE,         # "overlay" vagy "palette"
+    GPU_TIMING_EVERY,
 )
 
-from .trt_runner import TRT10Runner, get_trt_runner, TRTPipelineRunner
+from .trt_runner import get_trt_runner, TRTPipelineRunner
 
 # ================================= ROS2 Node =================================
 
@@ -55,8 +54,8 @@ class InferenceNode(Node):
         self.trt_runner = get_trt_runner(ENGINE, DEFAULT_INPUT_SHAPE)
         # Pipeline runner (double-buffer)
         try:
-            self.pipeline = TRTPipelineRunner(self.trt_runner, num_slots=2)
-            self.get_logger().info("Pipeline runner inicializálva (2 slot)")
+            self.pipeline = TRTPipelineRunner(self.trt_runner, num_slots=3)
+            self.get_logger().info("Pipeline runner inicializálva (3 slot)")
         except Exception as e:
             self.get_logger().warn(f"Pipeline init hiba, fallback sync mód: {e}")
             self.pipeline = None
@@ -108,6 +107,14 @@ class InferenceNode(Node):
         self.get_logger().info("Node készen áll. Várjuk a frame-eket…")
         # Polling timer pipeline fetch-hez
         self._poll_timer = self.create_timer(0.0, self._poll_pipeline)
+        # GPU timing mintavételezés
+        try:
+            self._timing_every = int(GPU_TIMING_EVERY)
+        except Exception:
+            self._timing_every = 1
+        if self._timing_every <= 0:
+            self._timing_every = 1
+        self._last_gpu_ms: float = 0.0
 
     # --------------------------- Dinamikus választó -----------------------------
     def _ensure_best_subscription(self) -> None:
@@ -240,6 +247,16 @@ class InferenceNode(Node):
         except Exception:
             return None
 
+    # ----------------------------- FPS helper -------------------------------
+    def _update_in_fps(self) -> None:
+        now = time.perf_counter()
+        if self._last_in_stamp is not None:
+            dt = now - self._last_in_stamp
+            if dt > 0:
+                inst_in = 1.0 / dt
+                self._in_fps_ema = (1 - self._alpha) * self._in_fps_ema + self._alpha * inst_in
+        self._last_in_stamp = now
+
     # ------------------------------ Common path -----------------------------
     def _ensure_buffers(self, out_h: int, out_w: int) -> None:
         need_overlay = (self._overlay is None) or (self._overlay.shape[0] != out_h) or (self._overlay.shape[1] != out_w)
@@ -261,7 +278,8 @@ class InferenceNode(Node):
         drive = self._select_map(drive_raw)
         lane_m = (lane > self.lane_thresh).astype(np.uint8)
         drive_m = (drive > self.drive_thresh).astype(np.uint8)
-        drive_m = drive_m * (1 - lane_m)
+        # In-place kizárás: ahol lane van, ott drive=0
+        drive_m[lane_m == 1] = 0
         h, w = frame.shape[:2]
         scale = float(OUT_SCALE)
         if not (0.0 < scale <= 1.0):
@@ -272,7 +290,7 @@ class InferenceNode(Node):
         lane_s  = cv2.resize(lane_m,  (out_w, out_h), interpolation=cv2.INTER_NEAREST)
         drive_s = cv2.resize(drive_m, (out_w, out_h), interpolation=cv2.INTER_NEAREST)
         if VIS_MODE.lower() == "palette":
-            combined = (lane_s.astype(np.uint8) * 1) + (drive_s.astype(np.uint8) * 2)
+            combined = lane_s + (drive_s * 2)
             self._vis[:, :, :] = self._lut[combined]
         else:
             frame_s = cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_AREA)
@@ -315,8 +333,9 @@ class InferenceNode(Node):
         rf = resized.astype(np.float32); rf *= (1.0/255.0)
         host_view[0,0,:,:] = rf[:,:,0]; host_view[0,1,:,:] = rf[:,:,1]; host_view[0,2,:,:] = rf[:,:,2]
         slot.frame = frame
-        # GPU idő mérés engedélyezve (measure_timing=True) a valós gpu_ms publikálásához
-        self.pipeline.enqueue(slot, host_view, measure_timing=True)
+        # GPU idő mérés csak minden N-edik frame-en a timing overhead csökkentésére
+        measure_timing = (self.frame_count % self._timing_every) == 0
+        self.pipeline.enqueue(slot, host_view, measure_timing=measure_timing)
 
     def _poll_pipeline(self) -> None:
         if self.pipeline is None:
@@ -324,12 +343,17 @@ class InferenceNode(Node):
         ready = self.pipeline.fetch_ready(copy_outputs=False)
         if not ready:
             return
-        now = time.perf_counter()
         for slot, outs, gpu_ms in ready:
             frame = slot.frame
             if frame is None:
                 continue
-            self._postprocess_and_publish(frame, outs, gpu_ms, slot.t_enqueue)
+            if gpu_ms <= 0.0:
+                # Nincs új mérés → használjuk az utolsó ismert értéket (becslés)
+                gpu_display = self._last_gpu_ms
+            else:
+                gpu_display = gpu_ms
+                self._last_gpu_ms = gpu_ms
+            self._postprocess_and_publish(frame, outs, gpu_display, slot.t_enqueue)
             slot.frame = None
 
     # --------------------------- Map kiválasztás ----------------------------
@@ -367,13 +391,7 @@ class InferenceNode(Node):
     # --------------------------- ROS2 callbackok ----------------------------
     def _image_cb_compressed(self, msg: CompressedImage) -> None:
         try:
-            now = time.perf_counter()
-            if self._last_in_stamp is not None:
-                dt = now - self._last_in_stamp
-                if dt > 0:
-                    inst_in_fps = 1.0 / dt
-                    self._in_fps_ema = (1 - self._alpha) * self._in_fps_ema + self._alpha * inst_in_fps
-            self._last_in_stamp = now
+            self._update_in_fps()
 
             frame = self._decode_compressed(msg)
             if frame is None:
@@ -385,13 +403,7 @@ class InferenceNode(Node):
 
     def _image_cb_raw(self, msg: Image) -> None:
         try:
-            now = time.perf_counter()
-            if self._last_in_stamp is not None:
-                dt = now - self._last_in_stamp
-                if dt > 0:
-                    inst_in_fps = 1.0 / dt
-                    self._in_fps_ema = (1 - self._alpha) * self._in_fps_ema + self._alpha * inst_in_fps
-            self._last_in_stamp = now
+            self._update_in_fps()
 
             frame = self._decode_image(msg)
             if frame is None:

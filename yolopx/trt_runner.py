@@ -1,7 +1,3 @@
-"""TensorRT runner modul a YOLOPX inference-hez.
-
-A korábbi monolit fájlból kiemelve: TRT10Runner, get_trt_runner, cache kezelés.
-"""
 from __future__ import annotations
 import threading
 import atexit
@@ -405,8 +401,7 @@ class TRTPipelineRunner:
             from .cuda_utils import cuda_event_query
             if not cuda_event_query(slot.event):
                 continue
-            # Sync a streamre egyszer (garantálja a host bufferek készségét)
-            self._cu['cuda_stream_sync'](self._streams[slot.idx])
+            # A done event a D2H másolatok után lett beütemezve; ha kész, a host bufferek konzisztensen olvashatók, nincs szükség stream szinkronra.
             if slot.gpu_ms < 0:
                 slot.gpu_ms = self._cu['cuda_event_elapsed_time'](self._events_start[slot.idx], self._events_stop[slot.idx])
             outs: Dict[str, np.ndarray] = {}
