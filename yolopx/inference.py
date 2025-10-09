@@ -269,15 +269,12 @@ class InferenceNode(Node):
     def _postprocess_and_publish(self, frame: np.ndarray, outs: Dict[str, np.ndarray], gpu_ms: float, t_enqueue: float) -> None:
         t0 = t_enqueue
         lane_raw = outs[self.trt_runner.lane_name]
-        if lane_raw.dtype != np.float32:
-            lane_raw = lane_raw.astype(np.float32)
         drive_raw = outs[self.trt_runner.drive_name]
-        if drive_raw.dtype != np.float32:
-            drive_raw = drive_raw.astype(np.float32)
         lane = self._select_map(lane_raw)
         drive = self._select_map(drive_raw)
-        lane_m = (lane > self.lane_thresh).astype(np.uint8)
-        drive_m = (drive > self.drive_thresh).astype(np.uint8)
+        # Közvetlen threshold az eredeti dtype-on; az astype(np.uint8) már a végeredményhez kell
+        lane_m = (lane > self.lane_thresh).astype(np.uint8, copy=False)
+        drive_m = (drive > self.drive_thresh).astype(np.uint8, copy=False)
         # In-place kizárás: ahol lane van, ott drive=0
         drive_m[lane_m == 1] = 0
         h, w = frame.shape[:2]

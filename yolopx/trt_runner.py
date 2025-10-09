@@ -74,10 +74,12 @@ class TRT10Runner:
 
         in_name = self.input_names[0]
         in_shape = list(self.engine.get_tensor_shape(in_name))
+        # Statikus shape elvárás: nincs -1 dim. (Ha -1 lenne, hibát dobunk a felesleges runtime shape beállítás elkerülésére.)
         if any(d < 0 for d in in_shape):
-            ok = self.context.set_input_shape(in_name, tuple(default_shape))
-            if not ok:
-                raise RuntimeError(f"set_input_shape({in_name}, {default_shape}) sikertelen")
+            raise RuntimeError(
+                "A betöltött engine dinamikus input dimenziót tartalmaz (-1). "
+                "Kérlek exportálj / buildelj statikus (fix shape) TensorRT engine-t a jobb teljesítmény érdekében."
+            )
 
         self.stream: CudaStream = cuda_stream_create()
         self._ev_start: CudaEvent = cuda_event_create()
@@ -309,6 +311,112 @@ class TRTPipelineRunner:
         self._input_dtype = base._input_dtype
         self._in_name = base._input_name
         self.output_names = list(base.output_names)
+        # Csak a szükséges kimeneteket hozzuk vissza hostra (D2H): lane + drive (ha nincs mask mód)
+        self.fetch_names = []  # type: List[str]
+        if base.lane_name:
+            self.fetch_names.append(base.lane_name)
+        if base.drive_name and base.drive_name not in self.fetch_names:
+            self.fetch_names.append(base.drive_name)
+        if not self.fetch_names:
+            # Fallback: ha nem találtuk meg a neveket, maradjon az összes
+            self.fetch_names = list(self.output_names)
+
+        # Opcionális eszköz oldali threshold (maszkok D2H, nem a teljes float térképek)
+        self._dev_thr_enabled = False
+        self._thr_funcs = None  # type: Tuple[object, object] | None
+        self._drv = None
+        self._mask_keys: Dict[str, str] = {}
+        self._map_info: Dict[str, Tuple[int, int, bool]] = {}  # name -> (offset_elems, n_pix, is_fp16)
+        if base.lane_name:
+            self._mask_keys[base.lane_name] = base.lane_name + ":mask"
+        if base.drive_name:
+            self._mask_keys[base.drive_name] = base.drive_name + ":mask"
+
+        # Előkészítjük a csatorna indexet és pixelek számát (NCHW feltételezve)
+        def _map_offset_npix(name: str) -> Tuple[int, int, bool]:
+            shp = self.base.shapes[name]
+            is_fp16 = (self.base.host[name].dtype == np.float16)
+            if len(shp) == 4:
+                n, c, h, w = shp
+                ch = 1 if c and c > 1 else 0
+                return ch * int(h) * int(w), int(h) * int(w), is_fp16
+            if len(shp) == 3:
+                c, h, w = shp
+                ch = 1 if c and c > 1 else 0
+                return ch * int(h) * int(w), int(h) * int(w), is_fp16
+            if len(shp) == 2:
+                h, w = shp
+                return 0, int(h) * int(w), is_fp16
+            raise RuntimeError(f"Váratlan output shape a device thresholdhöz: {shp}")
+        try:
+            if base.lane_name and base.drive_name:
+                self._map_info[base.lane_name] = _map_offset_npix(base.lane_name)
+                self._map_info[base.drive_name] = _map_offset_npix(base.drive_name)
+        except Exception:
+            self._map_info = {}
+
+        # NVRTC fordítás (ha elérhető)
+        try:
+            import importlib as _imp
+            _nvrtc = _imp.import_module('cuda.nvrtc')
+            _drv = _imp.import_module('cuda.cuda')
+            code_f32 = (
+                'extern "C" __global__ void thr2_f32(const float* lane, const float* drive, unsigned char* lm, unsigned char* dm, int n, float lt, float dt) {'
+                ' int i = blockIdx.x * blockDim.x + threadIdx.x;'
+                ' if (i < n) {'
+                '   unsigned char l = lane[i] > lt;'
+                '   unsigned char d = drive[i] > dt;'
+                '   if (l) d = 0;'
+                '   lm[i] = l; dm[i] = d;'
+                ' } }'
+            )
+            code_f16 = (
+                '#include <cuda_fp16.h>\n'
+                'extern "C" __global__ void thr2_f16(const __half* lane, const __half* drive, unsigned char* lm, unsigned char* dm, int n, float lt, float dt) {'
+                ' int i = blockIdx.x * blockDim.x + threadIdx.x;'
+                ' if (i < n) {'
+                '   float lf = __half2float(lane[i]);'
+                '   float df = __half2float(drive[i]);'
+                '   unsigned char l = lf > lt;'
+                '   unsigned char d = df > dt;'
+                '   if (l) d = 0;'
+                '   lm[i] = l; dm[i] = d;'
+                ' } }'
+            )
+            def _compile(name: str, src: str):
+                prog = _nvrtc.nvrtcCreateProgram(src.encode('utf-8'), (name+".cu").encode('utf-8'), 0, [], [])[1]
+                opts = [b"--std=c++11"]
+                res = _nvrtc.nvrtcCompileProgram(prog, len(opts), opts)
+                if res[0] != 0:
+                    log = _nvrtc.nvrtcGetProgramLog(prog)[1].decode('utf-8', 'ignore')
+                    _nvrtc.nvrtcDestroyProgram(prog)
+                    raise RuntimeError(f"NVRTC compile failed for {name}:\n{log}")
+                ptx = _nvrtc.nvrtcGetPTX(prog)[1]
+                _nvrtc.nvrtcDestroyProgram(prog)
+                return ptx
+            ptx32 = _compile("thr2_f32", code_f32)
+            ptx16 = _compile("thr2_f16", code_f16)
+            # Driver init
+            _drv.cuInit(0)
+            mod32 = _drv.cuModuleLoadData(ptx32)[1]
+            mod16 = _drv.cuModuleLoadData(ptx16)[1]
+            fn32 = _drv.cuModuleGetFunction(mod32, b"thr2_f32")[1]
+            fn16 = _drv.cuModuleGetFunction(mod16, b"thr2_f16")[1]
+            self._thr_funcs = (fn32, fn16)
+            self._drv = _drv
+            # Ha minden meta adott, engedélyezzük
+            if self._map_info:
+                self._dev_thr_enabled = True
+        except Exception:
+            self._dev_thr_enabled = False
+
+        # Threshold értékek (Node-ból állítható)
+        self._thr_lane = 0.5
+        self._thr_drive = 0.5
+
+        # Ha eszköz oldali threshold aktív, ne kérjünk vissza float térképeket
+        if self._dev_thr_enabled:
+            self.fetch_names = []
         self.slots: list[TRTPipelineSlot] = []
         self._streams: list[CudaStream] = []
         self._ctxs: list[trt.IExecutionContext] = []
@@ -346,6 +454,20 @@ class TRTPipelineRunner:
             slot_event_done = self._cu['cuda_event_create']()
 
             slot = TRTPipelineSlot(i, in_host, in_dev, out_host, out_dev, slot_event_done)
+            # Opcionális mask bufferek
+            if self._dev_thr_enabled and base.lane_name and base.drive_name:
+                try:
+                    _, n_pix, _ = self._map_info[base.lane_name]
+                    ml_h, _ = self._cu['pinned_empty_1d'](n_pix, np.uint8)
+                    md_h, _ = self._cu['pinned_empty_1d'](n_pix, np.uint8)
+                    ml_d = self._cu['cuda_malloc'](n_pix)
+                    md_d = self._cu['cuda_malloc'](n_pix)
+                    slot.out_host[self._mask_keys[base.lane_name]] = ml_h
+                    slot.out_dev[self._mask_keys[base.lane_name]] = ml_d
+                    slot.out_host[self._mask_keys[base.drive_name]] = md_h
+                    slot.out_dev[self._mask_keys[base.drive_name]] = md_d
+                except Exception:
+                    pass
             self.slots.append(slot)
             self._streams.append(stream)
             self._ctxs.append(ctx)
@@ -364,13 +486,17 @@ class TRTPipelineRunner:
             raise RuntimeError("Slot already busy")
         if tuple(nchw.shape) != self._input_shape:
             raise ValueError("Shape mismatch")
-        # Host kitöltés
-        if self._input_is_fp16 and nchw.dtype != np.float16:
-            np.asarray(nchw, dtype=np.float16, order="C", out=slot.in_host.reshape(self._input_shape))
+        # Host kitöltés (elkerüljük a felesleges másolatot, ha már a slot buffer nézete jön)
+        slot_view = slot.in_host.reshape(self._input_shape)
+        if np.shares_memory(nchw, slot_view):
+            pass  # már a megfelelő helyen vannak az adatok
         else:
-            if nchw.dtype != self._input_dtype:
-                raise TypeError("Input dtype mismatch")
-            slot.in_host[...] = nchw.ravel()
+            if self._input_is_fp16 and nchw.dtype != np.float16:
+                np.asarray(nchw, dtype=np.float16, order="C", out=slot_view)
+            else:
+                if nchw.dtype != self._input_dtype:
+                    raise TypeError("Input dtype mismatch")
+                slot_view[...] = nchw
         stream = self._streams[slot.idx]
         ctx = self._ctxs[slot.idx]
         # enqueue időbélyeg
@@ -382,8 +508,43 @@ class TRTPipelineRunner:
         ok = ctx.execute_async_v3(stream_handle=int(stream))
         if not ok:
             raise RuntimeError("execute_async_v3 fail")
-        for name in self.output_names:
-            self._cu['cuda_memcpy_dtoh_async'](slot.out_host[name], slot.out_dev[name], stream)
+        if self._dev_thr_enabled and self.base.lane_name and self.base.drive_name and self._thr_funcs:
+            try:
+                lane = self.base.lane_name; drive = self.base.drive_name
+                off_l, n_pix, is_f16 = self._map_info[lane]
+                off_d, _, _ = self._map_info[drive]
+                esz = 2 if is_f16 else 4
+                lane_ptr = int(slot.out_dev[lane]) + off_l * esz
+                drive_ptr = int(slot.out_dev[drive]) + off_d * esz
+                ml_d = int(slot.out_dev[self._mask_keys[lane]])
+                md_d = int(slot.out_dev[self._mask_keys[drive]])
+                # thresholds Node-ból állítva
+                lt = float(self._thr_lane)
+                dt = float(self._thr_drive)
+                fn = self._thr_funcs[1] if is_f16 else self._thr_funcs[0]
+                import ctypes as _ct
+                args = (
+                    _ct.c_void_p(lane_ptr), _ct.c_void_p(drive_ptr),
+                    _ct.c_void_p(ml_d), _ct.c_void_p(md_d),
+                    _ct.c_int(n_pix), _ct.c_float(lt), _ct.c_float(dt)
+                )
+                arg_ptrs = (_ct.c_void_p * len(args))(*[ _ct.cast(_ct.pointer(a), _ct.c_void_p) for a in args ])
+                block = 256
+                grid = (n_pix + block - 1) // block
+                self._drv.cuLaunchKernel(
+                    fn, grid, 1, 1, block, 1, 1, 0,
+                    int(stream), arg_ptrs, None
+                )
+                # D2H maskok
+                self._cu['cuda_memcpy_dtoh_async'](slot.out_host[self._mask_keys[lane]], ml_d, stream)
+                self._cu['cuda_memcpy_dtoh_async'](slot.out_host[self._mask_keys[drive]], md_d, stream)
+            except Exception:
+                # Fallback: eredeti térképek D2H
+                for name in self.fetch_names:
+                    self._cu['cuda_memcpy_dtoh_async'](slot.out_host[name], slot.out_dev[name], stream)
+        else:
+            for name in self.fetch_names:
+                self._cu['cuda_memcpy_dtoh_async'](slot.out_host[name], slot.out_dev[name], stream)
         if measure_timing:
             self._cu['cuda_event_record'](self._events_stop[slot.idx], stream)
         # Done event
@@ -405,17 +566,38 @@ class TRTPipelineRunner:
             if slot.gpu_ms < 0:
                 slot.gpu_ms = self._cu['cuda_event_elapsed_time'](self._events_start[slot.idx], self._events_stop[slot.idx])
             outs: Dict[str, np.ndarray] = {}
-            if copy_outputs:
-                for n in self.output_names:
-                    shape = self.base.shapes[n]
-                    outs[n] = slot.out_host[n].reshape(shape).copy()
+            if self._dev_thr_enabled and self.base.lane_name and self.base.drive_name:
+                # Csak maszkokat adjunk vissza, az eredeti kimenetneveken (kompatibilis a jelenlegi postprocess-szel)
+                h, w = self.base.shapes[self.base.lane_name][-2:]
+                lk = self._mask_keys[self.base.lane_name]
+                dk = self._mask_keys[self.base.drive_name]
+                if copy_outputs:
+                    if lk in slot.out_host:
+                        outs[self.base.lane_name] = slot.out_host[lk].reshape(h, w).copy()
+                    if dk in slot.out_host:
+                        outs[self.base.drive_name] = slot.out_host[dk].reshape(h, w).copy()
+                else:
+                    if lk in slot.out_host:
+                        outs[self.base.lane_name] = slot.out_host[lk].reshape(h, w)
+                    if dk in slot.out_host:
+                        outs[self.base.drive_name] = slot.out_host[dk].reshape(h, w)
             else:
-                for n in self.output_names:
-                    outs[n] = slot.out_host[n].reshape(self.base.shapes[n])
+                if copy_outputs:
+                    for n in self.fetch_names:
+                        shape = self.base.shapes[n]
+                        outs[n] = slot.out_host[n].reshape(shape).copy()
+                else:
+                    for n in self.fetch_names:
+                        outs[n] = slot.out_host[n].reshape(self.base.shapes[n])
             gpu_ms = slot.gpu_ms
             slot.busy = False
             ready.append((slot, outs, gpu_ms))
         return ready
+
+    # --- Config API ---
+    def set_thresholds(self, lane: float, drive: float) -> None:
+        self._thr_lane = float(lane)
+        self._thr_drive = float(drive)
 
     def close(self):
         # Felszabadítás

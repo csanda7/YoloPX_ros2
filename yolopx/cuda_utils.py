@@ -127,6 +127,28 @@ def cuda_memcpy_dtoh_async(dst_np: np.ndarray, src_dev_ptr: DevicePtr, stream: C
         )
 
 
+def cuda_memcpy_dtod_async(dst_dev_ptr: DevicePtr, src_dev_ptr: DevicePtr, nbytes: int, stream: CudaStream) -> None:
+    try:
+        check_cuda(
+            cudart.cudaMemcpyAsync(
+                int(dst_dev_ptr),
+                int(src_dev_ptr),
+                int(nbytes),
+                cudart.cudaMemcpyKind.cudaMemcpyDeviceToDevice,
+                int(stream),
+            )
+        )
+    except TypeError:
+        check_cuda(
+            cudart.cudaMemcpyAsync(
+                ctypes.c_void_p(int(dst_dev_ptr)),
+                ctypes.c_void_p(int(src_dev_ptr)),
+                int(nbytes),
+                cudart.cudaMemcpyKind.cudaMemcpyDeviceToDevice,
+                ctypes.c_void_p(int(stream)),
+            )
+        )
+
 # --- Pinned host memória ---
 
 def cuda_host_alloc(nbytes: int) -> int:
