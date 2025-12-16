@@ -293,8 +293,8 @@ class InferenceNode(Node):
             frame_s = cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_AREA)
             ov = self._overlay
             ov.fill(0)
-            ov[..., 1] = lane_s; np.multiply(ov[..., 1], 255, out=ov[..., 1], casting='unsafe')
-            ov[..., 2] = drive_s; np.multiply(ov[..., 2], 255, out=ov[..., 2], casting='unsafe')
+            ov[..., 2] = lane_s; np.multiply(ov[..., 2], 255, out=ov[..., 2], casting='unsafe')
+            ov[..., 1] = drive_s; np.multiply(ov[..., 1], 255, out=ov[..., 1], casting='unsafe')
             cv2.addWeighted(frame_s, 0.6, ov, 0.4, 0.0, dst=self._vis)
         e2e_ms = (time.perf_counter() - t0) * 1000.0
         msg = self._bgr8_to_image_msg(self._vis)

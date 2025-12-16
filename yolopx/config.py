@@ -1,5 +1,5 @@
 # ------------------------------ Model & IO ---------------------------------
-ENGINE: str = "//home/csanda/Work/JKK/ros2/yolopx/models/yolopx_2.engine"  
+ENGINE: str = "/home/csanda/Work/JKK/ros2/yolopx/models/yolopx5.engine"  
 TOPIC: str = "/zed2i/zed_node/left/image_rect_color"
 RELIABLE: bool = False  
 SHOW: bool = True       #opencv ablak
