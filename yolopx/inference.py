@@ -86,9 +86,16 @@ class InferenceNode(Node):
         self.frame_count: int = 0
         self.create_timer(WATCHDOG_PERIOD_SEC, self._watchdog)
 
-        # ---- Kimeneti publisher: bgr8 ----
+        # ---- Kimeneti publisherek ----
+        # Fő vizualizációs overlay (bgr8)
         self.pub_mask = self.create_publisher(Image, OUT_TOPIC, 10)
         self.get_logger().info(f"Publikálás: {VIS_MODE} -> {OUT_TOPIC} (bgr8)")
+
+        # Külön maszkok külön topicokon (mono8)
+        self.pub_lane_mask = self.create_publisher(Image, "/yolopx_lanes", 10)
+        self.pub_drive_mask = self.create_publisher(Image, "/yolopx_driveable_area", 10)
+        self.get_logger().info("Publikálás: sáv maszk -> /yolopx_lanes (mono8)")
+        self.get_logger().info("Publikálás: driveable area maszk -> /yolopx_driveable_area (mono8)")
 
         # ---- Viz bufferek (újrahasznosítás CPU kíméléshez) ----
         self._overlay: np.ndarray | None = None
@@ -286,6 +293,14 @@ class InferenceNode(Node):
         self._ensure_buffers(out_h, out_w)
         lane_s  = cv2.resize(lane_m,  (out_w, out_h), interpolation=cv2.INTER_NEAREST)
         drive_s = cv2.resize(drive_m, (out_w, out_h), interpolation=cv2.INTER_NEAREST)
+
+        # Publikáljuk a bináris maszkokat külön topicokra (0 / 255 intenzitással)
+        lane_mask_img = (lane_s * 255).astype(np.uint8, copy=False)
+        drive_mask_img = (drive_s * 255).astype(np.uint8, copy=False)
+        lane_msg = self._mask_to_image_msg(lane_mask_img)
+        drive_msg = self._mask_to_image_msg(drive_mask_img)
+        self.pub_lane_mask.publish(lane_msg)
+        self.pub_drive_mask.publish(drive_msg)
         if VIS_MODE.lower() == "palette":
             combined = lane_s + (drive_s * 2)
             self._vis[:, :, :] = self._lut[combined]
@@ -383,6 +398,24 @@ class InferenceNode(Node):
         msg.is_bigendian = 0
         msg.step = int(w) * 3
         msg.data = bgr.tobytes()
+        return msg
+
+    def _mask_to_image_msg(self, mask: np.ndarray) -> Image:
+        if mask.dtype != np.uint8:
+            mask = mask.astype(np.uint8)
+        if mask.ndim != 2:
+            raise ValueError("mask message expects HxW array")
+        msg = Image()
+        msg.header = Header()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = FRAME_ID
+        h, w = mask.shape
+        msg.height = int(h)
+        msg.width = int(w)
+        msg.encoding = 'mono8'
+        msg.is_bigendian = 0
+        msg.step = int(w)
+        msg.data = mask.tobytes()
         return msg
 
     # --------------------------- ROS2 callbackok ----------------------------
