@@ -35,6 +35,9 @@ from yolopx.config import (
     GPU_TIMING_EVERY,
 )
 
+
+PUBLISH_FRAME_ID = "zed_camera_front"
+
 from .trt_runner import get_trt_runner, TRTPipelineRunner
 
 # ================================= ROS2 Node =================================
@@ -273,7 +276,25 @@ class InferenceNode(Node):
         if need_vis:
             self._vis = np.zeros((out_h, out_w, 3), dtype=np.uint8)
 
-    def _postprocess_and_publish(self, frame: np.ndarray, outs: Dict[str, np.ndarray], gpu_ms: float, t_enqueue: float) -> None:
+    def _make_header(self, src: Header | None) -> Header:
+        h = Header()
+        if src is not None:
+            try:
+                if getattr(src, "stamp", None) is not None and (src.stamp.sec != 0 or src.stamp.nanosec != 0):
+                    h.stamp = src.stamp
+                else:
+                    h.stamp = self.get_clock().now().to_msg()
+            except Exception:
+                h.stamp = self.get_clock().now().to_msg()
+
+            # Force a stable, explicit frame_id for downstream TF users.
+            h.frame_id = PUBLISH_FRAME_ID
+        else:
+            h.stamp = self.get_clock().now().to_msg()
+            h.frame_id = PUBLISH_FRAME_ID
+        return h
+
+    def _postprocess_and_publish(self, frame: np.ndarray, outs: Dict[str, np.ndarray], gpu_ms: float, t_enqueue: float, in_header: Header | None) -> None:
         t0 = t_enqueue
         lane_raw = outs[self.trt_runner.lane_name]
         drive_raw = outs[self.trt_runner.drive_name]
@@ -297,8 +318,8 @@ class InferenceNode(Node):
         # Publikáljuk a bináris maszkokat külön topicokra (0 / 255 intenzitással)
         lane_mask_img = (lane_s * 255).astype(np.uint8, copy=False)
         drive_mask_img = (drive_s * 255).astype(np.uint8, copy=False)
-        lane_msg = self._mask_to_image_msg(lane_mask_img)
-        drive_msg = self._mask_to_image_msg(drive_mask_img)
+        lane_msg = self._mask_to_image_msg(lane_mask_img, in_header)
+        drive_msg = self._mask_to_image_msg(drive_mask_img, in_header)
         self.pub_lane_mask.publish(lane_msg)
         self.pub_drive_mask.publish(drive_msg)
         if VIS_MODE.lower() == "palette":
@@ -312,11 +333,11 @@ class InferenceNode(Node):
             ov[..., 2] = drive_s; np.multiply(ov[..., 2], 255, out=ov[..., 2], casting='unsafe')
             cv2.addWeighted(frame_s, 0.6, ov, 0.4, 0.0, dst=self._vis)
         e2e_ms = (time.perf_counter() - t0) * 1000.0
-        msg = self._bgr8_to_image_msg(self._vis)
+        msg = self._bgr8_to_image_msg(self._vis, in_header)
         self.pub_mask.publish(msg)
         self._publish_metrics(e2e_ms=e2e_ms, gpu_ms=gpu_ms)
 
-    def _process_frame(self, frame: np.ndarray) -> None:
+    def _process_frame(self, frame: np.ndarray, in_header: Header | None) -> None:
         if frame is None:
             return
         now = time.perf_counter()
@@ -332,7 +353,7 @@ class InferenceNode(Node):
             t_enqueue = time.perf_counter()
             self._preprocess(frame)
             outs, gpu_ms = self.trt_runner.infer_timed(None, copy_outputs=False)
-            self._postprocess_and_publish(frame, outs, gpu_ms, t_enqueue)
+            self._postprocess_and_publish(frame, outs, gpu_ms, t_enqueue, in_header)
             return
         # Pipeline: slot -> preprocess -> enqueue (ha nincs szabad, eldobjuk a frame-et)
         slot = self.pipeline.acquire_slot()
@@ -344,7 +365,8 @@ class InferenceNode(Node):
         resized = cv2.resize(frame, (host_view.shape[3], host_view.shape[2]), interpolation=cv2.INTER_LINEAR)
         rf = resized.astype(np.float32); rf *= (1.0/255.0)
         host_view[0,0,:,:] = rf[:,:,0]; host_view[0,1,:,:] = rf[:,:,1]; host_view[0,2,:,:] = rf[:,:,2]
-        slot.frame = frame
+        # Store header together with the frame so pipelined publish keeps the correct stamp/frame_id.
+        slot.frame = (frame, in_header)
         # GPU idő mérés csak minden N-edik frame-en a timing overhead csökkentésére
         measure_timing = (self.frame_count % self._timing_every) == 0
         self.pipeline.enqueue(slot, host_view, measure_timing=measure_timing)
@@ -356,16 +378,20 @@ class InferenceNode(Node):
         if not ready:
             return
         for slot, outs, gpu_ms in ready:
-            frame = slot.frame
-            if frame is None:
+            payload = slot.frame
+            if payload is None:
                 continue
+            if isinstance(payload, tuple) and len(payload) == 2:
+                frame, in_header = payload
+            else:
+                frame, in_header = payload, None
             if gpu_ms <= 0.0:
                 # Nincs új mérés → használjuk az utolsó ismert értéket (becslés)
                 gpu_display = self._last_gpu_ms
             else:
                 gpu_display = gpu_ms
                 self._last_gpu_ms = gpu_ms
-            self._postprocess_and_publish(frame, outs, gpu_display, slot.t_enqueue)
+            self._postprocess_and_publish(frame, outs, gpu_display, slot.t_enqueue, in_header)
             slot.frame = None
 
     # --------------------------- Map kiválasztás ----------------------------
@@ -382,15 +408,13 @@ class InferenceNode(Node):
         raise ValueError(f"Váratlan output shape: {arr.shape}")
 
     # --------------------------- Numpy → Image msg --------------------------
-    def _bgr8_to_image_msg(self, bgr: np.ndarray) -> Image:
+    def _bgr8_to_image_msg(self, bgr: np.ndarray, in_header: Header | None = None) -> Image:
         if bgr.dtype != np.uint8:
             bgr = bgr.astype(np.uint8)
         if bgr.ndim != 3 or bgr.shape[2] != 3:
             raise ValueError("bgr8 message expects HxWx3 array")
         msg = Image()
-        msg.header = Header()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = FRAME_ID
+        msg.header = self._make_header(in_header)
         h, w = bgr.shape[:2]
         msg.height = int(h)
         msg.width = int(w)
@@ -400,15 +424,13 @@ class InferenceNode(Node):
         msg.data = bgr.tobytes()
         return msg
 
-    def _mask_to_image_msg(self, mask: np.ndarray) -> Image:
+    def _mask_to_image_msg(self, mask: np.ndarray, in_header: Header | None = None) -> Image:
         if mask.dtype != np.uint8:
             mask = mask.astype(np.uint8)
         if mask.ndim != 2:
             raise ValueError("mask message expects HxW array")
         msg = Image()
-        msg.header = Header()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = FRAME_ID
+        msg.header = self._make_header(in_header)
         h, w = mask.shape
         msg.height = int(h)
         msg.width = int(w)
@@ -427,7 +449,7 @@ class InferenceNode(Node):
             if frame is None:
                 self.get_logger().warn("imdecode None-t adott vissza (CompressedImage)")
                 return
-            self._process_frame(frame)
+            self._process_frame(frame, msg.header)
         except Exception as e:
             self.get_logger().error(f"Compressed callback hiba: {e}")
 
@@ -439,7 +461,7 @@ class InferenceNode(Node):
             if frame is None:
                 self.get_logger().warn("Image decode sikertelen (raw)")
                 return
-            self._process_frame(frame)
+            self._process_frame(frame, msg.header)
         except Exception as e:
             self.get_logger().error(f"Raw Image callback hiba: {e}")
 
