@@ -24,4 +24,4 @@ FRAME_ID = "zed_camera_front"
 VIS_MODE = "palette"   # overlay vagy "palette" (olcsóbb)
 PREFER_COMPRESSED = True  
 
-GPU_TIMING_EVERY: int = 3
+GPU_TIMING_EVERY: int = 3 # How often to log GPU timing info (in frames)
