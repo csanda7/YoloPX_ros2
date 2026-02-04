@@ -2,7 +2,7 @@ from __future__ import annotations
 import ctypes
 from typing import Tuple
 import numpy as np
-from cuda import cudart
+import cuda.cudart as cudart
 
 DevicePtr = int
 CudaStream = int
